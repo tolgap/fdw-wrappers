@@ -56,7 +56,6 @@ firebase_fdw = [
     "reqwest-retry",
     "serde_json",
     "yup-oauth2",
-    "regex",
     "thiserror",
 ]
 s3_fdw = [

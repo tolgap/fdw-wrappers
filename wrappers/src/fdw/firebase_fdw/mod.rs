@@ -58,6 +58,9 @@ enum FirebaseFdwError {
 
     #[error("response too large ({0} bytes). Maximum allowed: {1} bytes")]
     ResponseTooLarge(usize, usize),
+
+    #[error("Firebase API request failed with {0}: {1}")]
+    ApiError(reqwest::StatusCode, String),
 }
 
 impl From<FirebaseFdwError> for ErrorReport {

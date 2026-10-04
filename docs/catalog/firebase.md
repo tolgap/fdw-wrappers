@@ -166,14 +166,13 @@ create foreign table firebase.docs (
   );
 ```
 
-Any other column is mapped to the top-level document field with the same name, so the fields can be queried and filtered like regular columns:
+Each other column maps to a top-level document field of the same name, see [Schema Mapping](#schema-mapping):
 
 ```sql
 create foreign table firebase.people (
   name text,
   "displayName" text,
   age bigint,
-  score double precision,
   active boolean,
   joined timestamp,
   city text
@@ -182,8 +181,6 @@ create foreign table firebase.people (
   options (
     object 'firestore/people'
   );
-
-select * from firebase.people where active and city = 'Amsterdam';
 ```
 
 #### Notes
@@ -194,30 +191,21 @@ select * from firebase.people where active and city = 'Amsterdam';
   - `firestore/my-collection`
   - `firestore/my-collection/my-document/another-collection`
 - The `attrs` column contains all document attributes in JSON format
-- Field names are case sensitive, so quote the column names of fields with upper case letters, like `"displayName"`
-- A field named `name`, `fields`, `created_at`, `updated_at` or `attrs` can't be mapped to a column, use the `attrs` column for it
-- A missing field or a `null` value is `NULL`, and a value which doesn't match the column type is an error. The field values are mapped to these column types:
 
-| Firestore value type | Column type                      |
-| -------------------- | -------------------------------- |
-| string               | `text`, `varchar`                |
-| integer              | `smallint`, `integer`, `bigint`  |
-| integer, double      | `real`, `double precision`       |
-| boolean              | `boolean`                        |
-| timestamp            | `timestamp`, `timestamptz`       |
-| any                  | `jsonb`, as the Firestore value  |
+## Schema Mapping
+
+Each column declared on a Firestore foreign table, other than the `name`, `fields`, `created_at`, `updated_at` and `attrs` columns, maps to a top-level document field of the same name (exact match):
+
+- Field names are case sensitive, so quote the column names of fields with upper case letters, like `"displayName"`.
+- If a document does not contain a field, or its value is `null`, the corresponding column is set to `NULL`.
+- Dots in column names are treated as literal characters — they do not traverse maps. Use the `attrs` column for nested field access, and for a field named like one of the columns above.
+- When an `attrs` or `fields` column is declared, the full documents are fetched from Firestore, otherwise only the fields of the declared columns.
 
 ## Query Pushdown Support
 
-This FDW supports `where` clause pushdown for `=` and `in` filters on the key columns below. Instead of listing all objects, only the matching objects are looked up in Firebase.
+### Authentication Users
 
-| Object                       | Column  | Firebase API call                                                                                                                      |
-| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| Authentication Users         | `uid`   | [accounts:lookup](https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup)                                  |
-| Authentication Users         | `email` | [accounts:lookup](https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup)                                  |
-| Firestore Database Documents | `name`  | [documents:batchGet](https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/batchGet)         |
-
-For example, this query
+`=` and `in` filters on the `uid` and `email` columns are pushed down to an [accounts:lookup](https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup) call, so only the matching users are fetched. For example, this query
 
 ```sql
 select * from firebase.users where email = 'foo@example.com';
@@ -225,26 +213,52 @@ select * from firebase.users where email = 'foo@example.com';
 
 will be translated to a single Firebase API call `POST https://identitytoolkit.googleapis.com/v1/projects/<project_id>/accounts:lookup` with request body `{"email": ["foo@example.com"]}`. An `in` filter with more than 100 values is not pushed down.
 
-### Firestore document fields
+### Firestore Database Documents
 
-Filters on the columns mapped to document fields are pushed down to a Firestore [query](https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/runQuery), so only the matching documents are fetched.
+This FDW supports `where` clause pushdown, the filters are sent in a Firestore [query](https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/runQuery).
 
-| Operator                 | Column types                                                   |
-| ------------------------ | -------------------------------------------------------------- |
-| `=`, `in`                | `text`, `boolean`, integer, float and timestamp types           |
-| `<`, `<=`, `>`, `>=`     | integer and timestamp types                                    |
+#### Supported Operators
 
-Firestore needs a [composite index](https://firebase.google.com/docs/firestore/query-data/index-overview) to combine equality filters with range filters, or range filters on different fields. So that no composite index is needed, either the equality filters on any fields are pushed down, or else the range filters on a single field. For example, in this query only `active = true` is pushed down, and `age > 30` is applied in Postgres:
+The following SQL predicates are translated to Firestore filter operators:
 
-```sql
-select * from firebase.people where active and age > 30;
-```
+| SQL predicate     | Firestore filter          |
+| ----------------- | ------------------------- |
+| `=`               | `EQUAL`                   |
+| `!=`              | `NOT_EQUAL`               |
+| `<`               | `LESS_THAN`               |
+| `<=`              | `LESS_THAN_OR_EQUAL`      |
+| `>`               | `GREATER_THAN`            |
+| `>=`              | `GREATER_THAN_OR_EQUAL`   |
+| `IN (...)`        | `IN`                      |
+| `NOT IN (...)`    | `NOT_IN`                  |
+| `IS NOT NULL`     | `IS_NOT_NULL`             |
 
-Range filters on `text` and float columns are not pushed down, as Postgres compares them differently than Firestore (by collation, and with `NaN` above all numbers). An `in` filter on more than 30 values is not pushed down either.
+Multiple `where` predicates are AND'd in a composite filter. The `name` column is filtered as the document `__name__`, by `=` and `IN (...)` only. Any predicate that is not supported is omitted from the Firestore filter and re-checked by Postgres after the documents are returned, so the result is always correct. These predicates are not pushed down:
 
-### Not pushed down
+- `IS NULL`, as Firestore doesn't match missing fields by it
+- `<`, `<=`, `>` and `>=` on `text` and float columns, as Postgres orders text by collation and `NaN` above all numbers, unlike Firestore
+- The predicates which Firestore can't [combine in one query](https://firebase.google.com/docs/firestore/query-data/queries#limitations) with the others: inequality filters (`!=`, `<`, `<=`, `>`, `>=`, `NOT IN` and `IS NOT NULL`) on more than one field, more than one `!=`, `NOT IN` or `IS NOT NULL`, more than one `IN` or `NOT IN`, and an `IN` with more than 30 or `NOT IN` with more than 10 values
+- Predicates on the `fields`, `created_at`, `updated_at` and `attrs` columns
 
-Other filters, including filters on the `attrs` column, `order by` and `limit` are not pushed down, they are applied in Postgres after the objects are fetched.
+`order by` and `limit` are not pushed down, because Postgres also passes the `limit` when a predicate isn't pushed down, like a predicate on the `attrs` column, so fetching fewer documents could leave out matching ones.
+
+!!! note
+
+    Firestore needs a [composite index](https://firebase.google.com/docs/firestore/query-data/index-overview#composite_indexes) to combine an inequality filter with a filter on another field, like `where active and age > 30`. Without the index, the query fails with an error containing a link to create it.
+
+## Supported Data Types
+
+| Firestore Type | Postgres Type                       | Notes                                           |
+| -------------- | ----------------------------------- | ----------------------------------------------- |
+| boolean        | bool                                |                                                 |
+| integer        | int2 / int4 / int8 / float4 / float8 |                                                 |
+| double         | float4 / float8                     |                                                 |
+| string         | text / varchar                      |                                                 |
+| timestamp      | timestamp / timestamptz             |                                                 |
+| any            | jsonb                               | The Firestore value, like `{"mapValue": {...}}` |
+| null / missing | any                                 | Column is set to `NULL`                         |
+
+A value which doesn't match the column type is an error.
 
 ## Limitations
 

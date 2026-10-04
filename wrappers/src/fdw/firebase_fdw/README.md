@@ -153,7 +153,7 @@ Below are the options can be used in `CREATE FOREIGN TABLE`:
 ## Limitations
 
 - Firebase Storage is not supported, please refer to [Firebase to Supabase migration guide](https://supabase.com/docs/guides/migrations/firebase-storage) to learn more about how to read its data out.
-- `WHERE` pushdown is only supported for `=` and `IN` filters on `uid` and `email` (Authentication users) and `name` (Firestore documents), and for filters on the columns mapped to Firestore document fields. Equality filters and range filters on another field are not pushed down together, as Firestore needs a composite index for that.
+- `WHERE` pushdown is supported for `=` and `IN` filters on `uid` and `email` (Authentication users), and for filters on the `name` and document field columns (Firestore documents).
 - Only top-level Firestore document fields can be mapped to columns.
 - `ORDER BY`, `LIMIT` pushdown are not supported.
 
