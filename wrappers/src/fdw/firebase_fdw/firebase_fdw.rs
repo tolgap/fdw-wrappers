@@ -1,5 +1,5 @@
 use crate::stats;
-use pgrx::{JsonB, pg_sys, prelude::*};
+use pgrx::{JsonB, PgBuiltInOids, PgOid, datetime::ToIsoString, pg_sys, prelude::*};
 use regex::Regex;
 use reqwest::{self, header};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
@@ -20,6 +20,13 @@ const DEFAULT_MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
 /// Maximum number of keys in a pushed down lookup, more keys fall back to a full scan
 const MAX_LOOKUP_KEYS: usize = 100;
 
+/// Maximum number of values in a Firestore `IN` filter
+/// ref: https://firebase.google.com/docs/firestore/query-data/queries#limitations
+const MAX_IN_VALUES: usize = 30;
+
+/// Columns of a Firestore document table which are not mapped to document fields
+const DOCUMENT_COLUMNS: [&str; 5] = ["name", "fields", "created_at", "updated_at", "attrs"];
+
 fn get_oauth2_token(sa_key: &str, rt: &Runtime) -> FirebaseFdwResult<AccessToken> {
     let creds = yup_oauth2::parse_service_account_key(sa_key.as_bytes())?;
     let sa = rt.block_on(ServiceAccountAuthenticator::builder(creds).build())?;
@@ -38,6 +45,7 @@ fn body_to_rows(
     obj_key: &str,
     normal_cols: Vec<(&str, &str, &str)>,
     tgt_cols: &[Column],
+    map_fields: bool,
 ) -> FirebaseFdwResult<Vec<Row>> {
     let mut result = Vec::new();
 
@@ -90,6 +98,10 @@ fn body_to_rows(
                     }
                 };
                 row.push(col_name, cell);
+            } else if map_fields && !DOCUMENT_COLUMNS.contains(&tgt_col.name.as_str()) {
+                // other columns are mapped to the document fields with the same name
+                let value = obj.get("fields").and_then(|v| v.get(&tgt_col.name));
+                row.push(&tgt_col.name, field_to_cell(value, tgt_col)?);
             }
         }
 
@@ -117,6 +129,7 @@ fn resp_to_rows(obj: &str, resp: &JsonValue, tgt_cols: &[Column]) -> FirebaseFdw
                 ("createdAt", "created_at", "timestamp"),
             ],
             tgt_cols,
+            false,
         ),
         _ => {
             // match firestore documents
@@ -131,6 +144,7 @@ fn resp_to_rows(obj: &str, resp: &JsonValue, tgt_cols: &[Column]) -> FirebaseFdw
                         ("updateTime", "updated_at", "timestamp_iso"),
                     ],
                     tgt_cols,
+                    true,
                 )
             } else {
                 Err(FirebaseFdwError::ObjectNotImplemented(obj.to_string()))
@@ -163,6 +177,173 @@ fn key_values(quals: &[Qual], field: &str) -> Option<Vec<String>> {
         })
 }
 
+// convert a Firestore document field value to a cell of the column type, a missing
+// field or a null value is NULL
+// ref: https://firebase.google.com/docs/firestore/reference/rest/v1/Value
+fn field_to_cell(value: Option<&JsonValue>, col: &Column) -> FirebaseFdwResult<Option<Cell>> {
+    let Some(value) = value.filter(|v| v.get("nullValue").is_none()) else {
+        return Ok(None);
+    };
+
+    let string = |key: &str| value.get(key).and_then(|v| v.as_str());
+    let integer = || string("integerValue").and_then(|v| v.parse::<i64>().ok());
+    // NaN and infinities are encoded as strings
+    let double = || {
+        let double = value.get("doubleValue");
+        double
+            .and_then(|v| v.as_f64())
+            .or_else(|| double.and_then(|v| v.as_str()?.parse().ok()))
+            .or_else(|| integer().map(|v| v as f64))
+    };
+
+    let cell = match PgOid::from(col.type_oid) {
+        PgOid::BuiltIn(PgBuiltInOids::BOOLOID) => value
+            .get("booleanValue")
+            .and_then(|v| v.as_bool())
+            .map(Cell::Bool),
+        PgOid::BuiltIn(PgBuiltInOids::INT2OID) => {
+            integer().and_then(|v| v.try_into().ok()).map(Cell::I16)
+        }
+        PgOid::BuiltIn(PgBuiltInOids::INT4OID) => {
+            integer().and_then(|v| v.try_into().ok()).map(Cell::I32)
+        }
+        PgOid::BuiltIn(PgBuiltInOids::INT8OID) => integer().map(Cell::I64),
+        PgOid::BuiltIn(PgBuiltInOids::FLOAT4OID) => double().map(|v| Cell::F32(v as f32)),
+        PgOid::BuiltIn(PgBuiltInOids::FLOAT8OID) => double().map(Cell::F64),
+        PgOid::BuiltIn(PgBuiltInOids::TEXTOID) | PgOid::BuiltIn(PgBuiltInOids::VARCHAROID) => {
+            string("stringValue").map(|v| Cell::String(v.to_owned()))
+        }
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPOID) => string("timestampValue")
+            .and_then(|v| Timestamp::from_str(v).ok())
+            .map(Cell::Timestamp),
+        PgOid::BuiltIn(PgBuiltInOids::TIMESTAMPTZOID) => string("timestampValue")
+            .and_then(|v| TimestampWithTimeZone::from_str(v).ok())
+            .map(Cell::Timestamptz),
+        PgOid::BuiltIn(PgBuiltInOids::JSONBOID) => Some(Cell::Json(JsonB(value.clone()))),
+        _ => return Err(FirebaseFdwError::UnsupportedColumnType(col.name.clone())),
+    };
+
+    cell.map(Some)
+        .ok_or_else(|| FirebaseFdwError::FieldTypeMismatch(col.name.clone(), value.to_string()))
+}
+
+// convert a qual value to a Firestore value. Postgres orders strings by collation
+// and NaN above all floats, so those are only converted for equality filters.
+fn cell_to_value(cell: &Cell, for_range: bool) -> Option<JsonValue> {
+    // Firestore timestamps are in UTC, from year 1 to 9999
+    let timestamp = |ts: Timestamp| {
+        (ts.is_finite() && (1..=9999).contains(&ts.year()))
+            .then(|| json!({ "timestampValue": format!("{}Z", ts.to_iso_string()) }))
+    };
+
+    match cell {
+        Cell::I8(v) => Some(json!({ "integerValue": v.to_string() })),
+        Cell::I16(v) => Some(json!({ "integerValue": v.to_string() })),
+        Cell::I32(v) => Some(json!({ "integerValue": v.to_string() })),
+        Cell::I64(v) => Some(json!({ "integerValue": v.to_string() })),
+        Cell::Timestamp(v) => timestamp(*v),
+        Cell::Timestamptz(v) if v.is_finite() => timestamp(v.to_utc()),
+        _ if for_range => None,
+        Cell::Bool(v) => Some(json!({ "booleanValue": v })),
+        Cell::F32(v) if v.is_finite() => Some(json!({ "doubleValue": *v as f64 })),
+        Cell::F64(v) if v.is_finite() => Some(json!({ "doubleValue": v })),
+        Cell::String(v) => Some(json!({ "stringValue": v })),
+        _ => None,
+    }
+}
+
+// quote a document field name for a field path, unless it is a simple name
+// ref: https://firebase.google.com/docs/firestore/reference/rest/v1/StructuredQuery#FieldReference
+fn field_path(name: &str) -> String {
+    let mut chars = name.chars();
+    let simple = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if simple {
+        name.to_string()
+    } else {
+        format!("`{}`", name.replace('\\', "\\\\").replace('`', "\\`"))
+    }
+}
+
+// get the Firestore filters on the document fields from the quals, and the field of
+// the range filters if any. Only the filters Firestore can serve from its automatic
+// single-field indexes are pushed down: the equality filters on any fields, or else
+// the range filters on one field, as combining them needs a composite index.
+// ref: https://firebase.google.com/docs/firestore/query-data/index-overview
+fn field_filters(quals: &[Qual]) -> (Vec<JsonValue>, Option<&str>) {
+    let filter = |field: &str, op: &str, value: JsonValue| {
+        json!({
+            "fieldFilter": {
+                "field": { "fieldPath": field_path(field) },
+                "op": op,
+                "value": value,
+            }
+        })
+    };
+
+    let mut equalities = Vec::new();
+    let mut ranges = Vec::new();
+    for qual in quals {
+        let field = qual.field.as_str();
+        if DOCUMENT_COLUMNS.contains(&field) {
+            continue;
+        }
+
+        match (&qual.value, qual.operator.as_str(), qual.use_or) {
+            (Value::Cell(cell), "=", false) => {
+                if let Some(value) = cell_to_value(cell, false) {
+                    equalities.push(filter(field, "EQUAL", value));
+                }
+            }
+            // Firestore allows only one `IN` filter in a query
+            (Value::Array(cells), "=", true)
+                if (1..=MAX_IN_VALUES).contains(&cells.len())
+                    && !equalities.iter().any(|f| f["fieldFilter"]["op"] == "IN") =>
+            {
+                let values = cells
+                    .iter()
+                    .map(|cell| cell_to_value(cell, false))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(mut values) = values {
+                    // duplicated values are rejected
+                    values.sort_by_key(|v| v.to_string());
+                    values.dedup();
+                    let values = json!({ "arrayValue": { "values": values } });
+                    equalities.push(filter(field, "IN", values));
+                }
+            }
+            (Value::Cell(cell), op, false) => {
+                let op = match op {
+                    "<" => "LESS_THAN",
+                    "<=" => "LESS_THAN_OR_EQUAL",
+                    ">" => "GREATER_THAN",
+                    ">=" => "GREATER_THAN_OR_EQUAL",
+                    _ => continue,
+                };
+                if let Some(value) = cell_to_value(cell, true) {
+                    ranges.push((field, filter(field, op, value)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !equalities.is_empty() {
+        return (equalities, None);
+    }
+    let Some(&(range_field, _)) = ranges.first() else {
+        return (Vec::new(), None);
+    };
+    let ranges = ranges
+        .into_iter()
+        .filter(|(field, _)| *field == range_field)
+        .map(|(_, filter)| filter)
+        .collect();
+    (ranges, Some(range_field))
+}
+
 #[wrappers_fdw(
     version = "0.1.4",
     author = "Supabase",
@@ -188,6 +369,13 @@ impl FirebaseFdw {
     // maximum allowed page size
     // https://firebase.google.com/docs/reference/admin/node/firebase-admin.auth.baseauth.md#baseauthlistusers
     const PAGE_SIZE: usize = 1000;
+
+    // page size of document queries, small in tests so paging through the results
+    // is tested too (the Firestore emulator doesn't page document lists)
+    #[cfg(not(feature = "pg_test"))]
+    const QUERY_PAGE_SIZE: usize = Self::PAGE_SIZE;
+    #[cfg(feature = "pg_test")]
+    const QUERY_PAGE_SIZE: usize = 2;
 
     // default maximum row count limit
     const DEFAULT_ROWS_LIMIT: usize = 10_000;
@@ -324,6 +512,95 @@ impl FirebaseFdw {
         Ok(None)
     }
 
+    // query the documents with the filters on their fields instead of listing all
+    // documents, returns None if the quals have no filters to push down
+    fn query_documents(
+        &self,
+        client: &ClientWithMiddleware,
+        obj: &str,
+        quals: &[Qual],
+        columns: &[Column],
+        row_cnt_limit: usize,
+        options: &HashMap<String, String>,
+    ) -> FirebaseFdwResult<Option<Vec<Row>>> {
+        let Some(collection) = obj.strip_prefix("firestore/") else {
+            return Ok(None);
+        };
+        let (filters, range_field) = field_filters(quals);
+        if filters.is_empty() {
+            return Ok(None);
+        }
+
+        // a nested collection is queried from its parent document, e.g. 'a/b/c'
+        // is collection 'c' in document 'a/b'
+        let (parent, collection_id) = match collection.rsplit_once('/') {
+            Some((parent, collection_id)) => (format!("/{parent}"), collection_id),
+            None => (String::new(), collection),
+        };
+
+        // ref: https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/runQuery
+        let base_url = require_option_or("base_url", options, Self::DEFAULT_FIRESTORE_BASE_URL);
+        let url = format!(
+            "{}/{}/databases/(default)/documents{}:runQuery",
+            base_url, self.project_id, parent
+        );
+
+        // order by the range filter field, which Firestore requires to be first, and
+        // the document name, so the next page can start after the last document
+        let mut order_by = Vec::new();
+        if let Some(field) = range_field {
+            order_by.push(json!({ "field": { "fieldPath": field_path(field) } }));
+        }
+        order_by.push(json!({ "field": { "fieldPath": "__name__" } }));
+
+        let mut query = json!({
+            "from": [{ "collectionId": collection_id }],
+            "where": { "compositeFilter": { "op": "AND", "filters": filters } },
+            "orderBy": order_by,
+            "limit": Self::QUERY_PAGE_SIZE,
+        });
+
+        let mut result = Vec::new();
+        loop {
+            let body = json!({ "structuredQuery": query });
+            let resp = self.fetch_json(Self::post_json(client, &url, body))?;
+            let docs = resp
+                .as_array()
+                .ok_or_else(|| FirebaseFdwError::InvalidResponse(resp.to_string()))?
+                .iter()
+                .filter_map(|v| v.get("document").cloned())
+                .collect::<Vec<_>>();
+
+            let page_len = docs.len();
+            let cursor = docs.last().map(|doc| {
+                let mut values = Vec::new();
+                if let Some(field) = range_field {
+                    values.push(doc["fields"][field].clone());
+                }
+                values.push(json!({ "referenceValue": doc["name"] }));
+                json!({ "values": values, "before": false })
+            });
+
+            result.append(&mut resp_to_rows(
+                obj,
+                &json!({ "documents": docs }),
+                columns,
+            )?);
+
+            // continue after the last document if the page is full
+            match cursor {
+                Some(cursor)
+                    if page_len == Self::QUERY_PAGE_SIZE && result.len() < row_cnt_limit =>
+                {
+                    query["startAt"] = cursor;
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Some(result))
+    }
+
     fn post_json(client: &ClientWithMiddleware, url: &str, body: JsonValue) -> RequestBuilder {
         client
             .post(url)
@@ -448,6 +725,10 @@ impl ForeignDataWrapper<FirebaseFdwError> for FirebaseFdw {
             if let Some(json) = self.lookup(client, obj, quals, options)? {
                 // the quals are pushed down, so only the matching objects are fetched
                 result = resp_to_rows(obj, &json, columns)?;
+            } else if let Some(rows) =
+                self.query_documents(client, obj, quals, columns, row_cnt_limit, options)?
+            {
+                result = rows;
             } else {
                 let mut next_page: Option<String> = None;
 

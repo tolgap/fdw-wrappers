@@ -26,6 +26,9 @@ enum FirebaseFdwError {
     #[error("column '{0}' data type is not supported")]
     UnsupportedColumnType(String),
 
+    #[error("column '{0}' type doesn't match Firestore value {1}")]
+    FieldTypeMismatch(String, String),
+
     #[error("invalid timestamp format: {0}")]
     InvalidTimestampFormat(String),
 

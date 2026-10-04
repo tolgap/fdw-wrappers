@@ -166,6 +166,26 @@ create foreign table firebase.docs (
   );
 ```
 
+Any other column is mapped to the top-level document field with the same name, so the fields can be queried and filtered like regular columns:
+
+```sql
+create foreign table firebase.people (
+  name text,
+  "displayName" text,
+  age bigint,
+  score double precision,
+  active boolean,
+  joined timestamp,
+  city text
+)
+  server firebase_server
+  options (
+    object 'firestore/people'
+  );
+
+select * from firebase.people where active and city = 'Amsterdam';
+```
+
 #### Notes
 
 - The `name`, `created_at`, and `updated_at` are automatic metadata fields on all Firestore collections
@@ -174,6 +194,18 @@ create foreign table firebase.docs (
   - `firestore/my-collection`
   - `firestore/my-collection/my-document/another-collection`
 - The `attrs` column contains all document attributes in JSON format
+- Field names are case sensitive, so quote the column names of fields with upper case letters, like `"displayName"`
+- A field named `name`, `fields`, `created_at`, `updated_at` or `attrs` can't be mapped to a column, use the `attrs` column for it
+- A missing field or a `null` value is `NULL`, and a value which doesn't match the column type is an error. The field values are mapped to these column types:
+
+| Firestore value type | Column type                      |
+| -------------------- | -------------------------------- |
+| string               | `text`, `varchar`                |
+| integer              | `smallint`, `integer`, `bigint`  |
+| integer, double      | `real`, `double precision`       |
+| boolean              | `boolean`                        |
+| timestamp            | `timestamp`, `timestamptz`       |
+| any                  | `jsonb`, as the Firestore value  |
 
 ## Query Pushdown Support
 
@@ -191,9 +223,28 @@ For example, this query
 select * from firebase.users where email = 'foo@example.com';
 ```
 
-will be translated to a single Firebase API call `POST https://identitytoolkit.googleapis.com/v1/projects/<project_id>/accounts:lookup` with request body `{"email": ["foo@example.com"]}`.
+will be translated to a single Firebase API call `POST https://identitytoolkit.googleapis.com/v1/projects/<project_id>/accounts:lookup` with request body `{"email": ["foo@example.com"]}`. An `in` filter with more than 100 values is not pushed down.
 
-Other filters, `order by` and `limit` are not pushed down, they are applied in Postgres after the objects are fetched. An `in` filter with more than 100 values is not pushed down either.
+### Firestore document fields
+
+Filters on the columns mapped to document fields are pushed down to a Firestore [query](https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/runQuery), so only the matching documents are fetched.
+
+| Operator                 | Column types                                                   |
+| ------------------------ | -------------------------------------------------------------- |
+| `=`, `in`                | `text`, `boolean`, integer, float and timestamp types           |
+| `<`, `<=`, `>`, `>=`     | integer and timestamp types                                    |
+
+Firestore needs a [composite index](https://firebase.google.com/docs/firestore/query-data/index-overview) to combine equality filters with range filters, or range filters on different fields. So that no composite index is needed, either the equality filters on any fields are pushed down, or else the range filters on a single field. For example, in this query only `active = true` is pushed down, and `age > 30` is applied in Postgres:
+
+```sql
+select * from firebase.people where active and age > 30;
+```
+
+Range filters on `text` and float columns are not pushed down, as Postgres compares them differently than Firestore (by collation, and with `NaN` above all numbers). An `in` filter on more than 30 values is not pushed down either.
+
+### Not pushed down
+
+Other filters, including filters on the `attrs` column, `order by` and `limit` are not pushed down, they are applied in Postgres after the objects are fetched.
 
 ## Limitations
 
