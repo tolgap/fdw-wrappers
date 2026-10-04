@@ -153,12 +153,14 @@ Below are the options can be used in `CREATE FOREIGN TABLE`:
 ## Limitations
 
 - Firebase Storage is not supported, please refer to [Firebase to Supabase migration guide](https://supabase.com/docs/guides/migrations/firebase-storage) to learn more about how to read its data out.
-- `WHERE`, `ORDER BY`, `LIMIT` pushdown are not supported.
+- `WHERE` pushdown is only supported for `=` and `IN` filters on `uid` and `email` (Authentication users) and `name` (Firestore documents).
+- `ORDER BY`, `LIMIT` pushdown are not supported.
 
 ## Changelog
 
 | Version | Date       | Notes                                                |
 | ------- | ---------- | ---------------------------------------------------- |
+| 0.1.4   | 2026-10-04 | Added quals pushdown support                         |
 | 0.1.3   | 2023-09-20 | Error reporting refactoring                          |
 | 0.1.2   | 2023-07-13 | Added fdw stats collection                           |
 | 0.1.1   | 2022-12-07 | Added validator function                             |

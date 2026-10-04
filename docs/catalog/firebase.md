@@ -177,7 +177,23 @@ create foreign table firebase.docs (
 
 ## Query Pushdown Support
 
-This FDW doesn't support query pushdown.
+This FDW supports `where` clause pushdown for `=` and `in` filters on the key columns below. Instead of listing all objects, only the matching objects are looked up in Firebase.
+
+| Object                       | Column  | Firebase API call                                                                                                                      |
+| ---------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Authentication Users         | `uid`   | [accounts:lookup](https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup)                                  |
+| Authentication Users         | `email` | [accounts:lookup](https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup)                                  |
+| Firestore Database Documents | `name`  | [documents:batchGet](https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/batchGet)         |
+
+For example, this query
+
+```sql
+select * from firebase.users where email = 'foo@example.com';
+```
+
+will be translated to a single Firebase API call `POST https://identitytoolkit.googleapis.com/v1/projects/<project_id>/accounts:lookup` with request body `{"email": ["foo@example.com"]}`.
+
+Other filters, `order by` and `limit` are not pushed down, they are applied in Postgres after the objects are fetched. An `in` filter with more than 100 values is not pushed down either.
 
 ## Limitations
 

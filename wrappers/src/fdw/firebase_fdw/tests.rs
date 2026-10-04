@@ -142,6 +142,124 @@ mod tests {
                     serde_json::json!({ "foo": { "stringValue": "bar" } })
                 )]
             );
+
+            c.update(
+                r#"
+                CREATE FOREIGN TABLE firebase_docs_empty (
+                  name text,
+                  attrs jsonb
+                )
+                SERVER my_firebase_server
+                OPTIONS (
+                  object 'firestore/empty-collection',
+                  base_url 'http://localhost:8080/v1/projects'
+                )
+             "#,
+                None,
+                &[],
+            )
+            .unwrap();
+
+            let results = c
+                .select("SELECT name FROM firebase_docs_empty", None, &[])
+                .unwrap()
+                .collect::<Vec<_>>();
+            assert!(results.is_empty());
+
+            // Rows fetched from Firebase but removed by the local filter, which
+            // is zero when the quals are pushed down
+            macro_rules! rows_removed_by_filter {
+                ($sql:expr) => {{
+                    let explain = format!(
+                        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+                        $sql
+                    );
+                    c.select(&explain, None, &[])
+                        .unwrap()
+                        .filter_map(|r| r.get::<&str>(1).unwrap().map(|s| s.to_string()))
+                        .find_map(|line| {
+                            line.trim()
+                                .strip_prefix("Rows Removed by Filter: ")
+                                .map(|n| n.parse::<i64>().unwrap())
+                        })
+                        .unwrap_or(0)
+                }};
+            }
+
+            macro_rules! select_emails {
+                ($sql:expr) => {{
+                    c.select($sql, None, &[])
+                        .unwrap()
+                        .filter_map(|r| r.get_by_name::<&str, _>("email").unwrap())
+                        .collect::<Vec<_>>()
+                }};
+            }
+
+            macro_rules! select_names {
+                ($sql:expr) => {{
+                    c.select($sql, None, &[])
+                        .unwrap()
+                        .filter_map(|r| r.get_by_name::<&str, _>("name").unwrap())
+                        .collect::<Vec<_>>()
+                }};
+            }
+
+            // auth users lookup by uid
+            let sql = "SELECT email FROM firebase_users WHERE uid = 'JeXJ2gUHCpYSQV6zXlRYfRYHUfMl'";
+            assert_eq!(select_emails!(sql), vec!["foo@example.com"]);
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            // auth users lookup by email
+            let sql = "SELECT email FROM firebase_users WHERE email = 'bar@example.com'";
+            assert_eq!(select_emails!(sql), vec!["bar@example.com"]);
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            let sql = "SELECT email FROM firebase_users
+                       WHERE email IN ('foo@example.com', 'missing@example.com')";
+            assert_eq!(select_emails!(sql), vec!["foo@example.com"]);
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            let sql = "SELECT email FROM firebase_users WHERE email = 'missing@example.com'";
+            assert!(select_emails!(sql).is_empty());
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            // quals which can't be pushed down are still filtered locally
+            let sql = "SELECT email FROM firebase_users WHERE email LIKE 'foo%'";
+            assert_eq!(select_emails!(sql), vec!["foo@example.com"]);
+            assert_eq!(rows_removed_by_filter!(sql), 1);
+
+            // firestore documents lookup by name
+            let sql = "SELECT name FROM firebase_docs WHERE name =
+                       'projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs'";
+            assert_eq!(
+                select_names!(sql),
+                vec![
+                    "projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs"
+                ]
+            );
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            let sql = "SELECT name FROM firebase_docs WHERE name =
+                       'projects/supa/databases/(default)/documents/my-collection/missing'";
+            assert!(select_names!(sql).is_empty());
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            // a document in a nested collection is not in the parent collection
+            let sql = "SELECT name FROM firebase_docs WHERE name =
+                       'projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs/my-collection2/fkSWL4hNJ3lRc1ZIorPm'";
+            assert!(select_names!(sql).is_empty());
+            assert_eq!(rows_removed_by_filter!(sql), 0);
+
+            let sql = "SELECT name FROM firebase_docs_nested WHERE name IN (
+                       'projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs/my-collection2/fkSWL4hNJ3lRc1ZIorPm',
+                       'projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs/my-collection2/missing')";
+            assert_eq!(
+                select_names!(sql),
+                vec![
+                    "projects/supa/databases/(default)/documents/my-collection/bSMScXpZHMJe9ilE9Yqs/my-collection2/fkSWL4hNJ3lRc1ZIorPm"
+                ]
+            );
+            assert_eq!(rows_removed_by_filter!(sql), 0);
         });
     }
 }

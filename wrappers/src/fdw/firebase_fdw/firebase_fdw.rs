@@ -2,10 +2,10 @@ use crate::stats;
 use pgrx::{JsonB, pg_sys, prelude::*};
 use regex::Regex;
 use reqwest::{self, header};
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, RequestBuilder};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
-use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use serde_json::{Value as JsonValue, json};
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use yup_oauth2::AccessToken;
 use yup_oauth2::ServiceAccountAuthenticator;
@@ -16,6 +16,9 @@ use super::{FirebaseFdwError, FirebaseFdwResult};
 
 /// Default maximum response size in bytes (10 MB) to prevent DoS via large responses
 const DEFAULT_MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+
+/// Maximum number of keys in a pushed down lookup, more keys fall back to a full scan
+const MAX_LOOKUP_KEYS: usize = 100;
 
 fn get_oauth2_token(sa_key: &str, rt: &Runtime) -> FirebaseFdwResult<AccessToken> {
     let creds = yup_oauth2::parse_service_account_key(sa_key.as_bytes())?;
@@ -38,11 +41,17 @@ fn body_to_rows(
 ) -> FirebaseFdwResult<Vec<Row>> {
     let mut result = Vec::new();
 
-    let objs = resp
+    let resp_obj = resp
         .as_object()
-        .and_then(|v| v.get(obj_key))
-        .and_then(|v| v.as_array())
-        .ok_or(FirebaseFdwError::InvalidResponse(resp.to_string()))?;
+        .ok_or_else(|| FirebaseFdwError::InvalidResponse(resp.to_string()))?;
+
+    // the key is left out when there are no objects, e.g. an empty collection
+    let Some(objs) = resp_obj.get(obj_key) else {
+        return Ok(result);
+    };
+    let objs = objs
+        .as_array()
+        .ok_or_else(|| FirebaseFdwError::InvalidResponse(resp.to_string()))?;
 
     for obj in objs {
         let mut row = Row::new();
@@ -130,8 +139,32 @@ fn resp_to_rows(obj: &str, resp: &JsonValue, tgt_cols: &[Column]) -> FirebaseFdw
     }
 }
 
+// get the values of an `=` or `IN (...)` qual on the key column `field`, so only
+// the objects with those keys need to be fetched, Postgres still rechecks all quals
+fn key_values(quals: &[Qual], field: &str) -> Option<Vec<String>> {
+    quals
+        .iter()
+        .filter(|qual| qual.field == field && qual.operator == "=")
+        .find_map(|qual| {
+            let mut values = match &qual.value {
+                Value::Cell(Cell::String(s)) if !qual.use_or => vec![s.clone()],
+                Value::Array(cells) if qual.use_or => cells
+                    .iter()
+                    .map(|cell| match cell {
+                        Cell::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+                _ => return None,
+            };
+            values.sort();
+            values.dedup();
+            (values.len() <= MAX_LOOKUP_KEYS).then_some(values)
+        })
+}
+
 #[wrappers_fdw(
-    version = "0.1.3",
+    version = "0.1.4",
     author = "Supabase",
     website = "https://github.com/supabase/wrappers/tree/main/wrappers/src/fdw/firebase_fdw",
     error_type = "FirebaseFdwError"
@@ -211,6 +244,117 @@ impl FirebaseFdw {
             }
         }
     }
+
+    // fetch only the objects whose keys are in the quals instead of listing all
+    // objects, returns None if the quals have no keys to look up
+    fn lookup(
+        &self,
+        client: &ClientWithMiddleware,
+        obj: &str,
+        quals: &[Qual],
+        options: &HashMap<String, String>,
+    ) -> FirebaseFdwResult<Option<JsonValue>> {
+        if obj == "auth/users" {
+            let (key, values) = match (key_values(quals, "uid"), key_values(quals, "email")) {
+                (Some(uids), _) => ("localId", uids),
+                (None, Some(emails)) => ("email", emails),
+                (None, None) => return Ok(None),
+            };
+            if values.is_empty() {
+                return Ok(Some(json!({})));
+            }
+
+            // ref: https://cloud.google.com/identity-platform/docs/reference/rest/v1/accounts/lookup
+            let base_url = require_option_or("base_url", options, Self::DEFAULT_AUTH_BASE_URL);
+            let url = format!("{}/{}/accounts:lookup", base_url, self.project_id);
+            let mut resp =
+                self.fetch_json(Self::post_json(client, &url, json!({ key: values })))?;
+
+            // the same user can be found by more than one key, e.g. emails
+            // differing in case only
+            if let Some(users) = resp.get_mut("users").and_then(|v| v.as_array_mut()) {
+                let mut seen = HashSet::new();
+                users.retain(|user| seen.insert(user.get("localId").cloned()));
+            }
+
+            return Ok(Some(resp));
+        }
+
+        if let Some(collection) = obj.strip_prefix("firestore/") {
+            let Some(names) = key_values(quals, "name") else {
+                return Ok(None);
+            };
+
+            // only the documents directly in this collection can match
+            let prefix = format!(
+                "projects/{}/databases/(default)/documents/{}/",
+                self.project_id, collection
+            );
+            let names = names
+                .into_iter()
+                .filter(|name| {
+                    name.strip_prefix(&prefix)
+                        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+                })
+                .collect::<Vec<_>>();
+            if names.is_empty() {
+                return Ok(Some(json!({})));
+            }
+
+            // ref: https://firebase.google.com/docs/firestore/reference/rest/v1beta1/projects.databases.documents/batchGet
+            let base_url = require_option_or("base_url", options, Self::DEFAULT_FIRESTORE_BASE_URL);
+            let url = format!(
+                "{}/{}/databases/(default)/documents:batchGet",
+                base_url, self.project_id
+            );
+            let resp =
+                self.fetch_json(Self::post_json(client, &url, json!({ "documents": names })))?;
+
+            // keep the found documents, in the same format as a documents list
+            let docs = resp
+                .as_array()
+                .ok_or_else(|| FirebaseFdwError::InvalidResponse(resp.to_string()))?
+                .iter()
+                .filter_map(|v| v.get("found").cloned())
+                .collect::<Vec<_>>();
+
+            return Ok(Some(json!({ "documents": docs })));
+        }
+
+        Ok(None)
+    }
+
+    fn post_json(client: &ClientWithMiddleware, url: &str, body: JsonValue) -> RequestBuilder {
+        client
+            .post(url)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string())
+    }
+
+    // send a request and parse its JSON response
+    fn fetch_json(&self, req: RequestBuilder) -> FirebaseFdwResult<JsonValue> {
+        let body = self.rt.block_on(req.send()).and_then(|resp| {
+            stats::inc_stats(
+                Self::FDW_NAME,
+                stats::Metric::BytesIn,
+                resp.content_length().unwrap_or(0) as i64,
+            );
+
+            resp.error_for_status()
+                .and_then(|resp| self.rt.block_on(resp.text()))
+                .map_err(reqwest_middleware::Error::from)
+        })?;
+
+        // Security: Check response size to prevent DoS
+        if body.len() > self.max_response_size {
+            return Err(FirebaseFdwError::ResponseTooLarge(
+                body.len(),
+                self.max_response_size,
+            ));
+        }
+
+        Ok(serde_json::from_str(&body)?)
+    }
 }
 
 impl ForeignDataWrapper<FirebaseFdwError> for FirebaseFdw {
@@ -283,7 +427,7 @@ impl ForeignDataWrapper<FirebaseFdwError> for FirebaseFdw {
 
     fn begin_scan(
         &mut self,
-        _quals: &[Qual],
+        quals: &[Qual],
         columns: &[Column],
         _sorts: &[Sort],
         _limit: &Option<Limit>,
@@ -299,46 +443,31 @@ impl ForeignDataWrapper<FirebaseFdwError> for FirebaseFdw {
         self.scan_result = Vec::new();
 
         if let Some(client) = &self.client {
-            let mut next_page: Option<String> = None;
             let mut result = Vec::new();
 
-            loop {
-                let url = self.build_url(obj, &next_page, options);
+            if let Some(json) = self.lookup(client, obj, quals, options)? {
+                // the quals are pushed down, so only the matching objects are fetched
+                result = resp_to_rows(obj, &json, columns)?;
+            } else {
+                let mut next_page: Option<String> = None;
 
-                let body = self.rt.block_on(client.get(&url).send()).and_then(|resp| {
-                    stats::inc_stats(
-                        Self::FDW_NAME,
-                        stats::Metric::BytesIn,
-                        resp.content_length().unwrap_or(0) as i64,
-                    );
+                loop {
+                    let url = self.build_url(obj, &next_page, options);
+                    let json = self.fetch_json(client.get(&url))?;
+                    let mut rows = resp_to_rows(obj, &json, columns)?;
+                    result.append(&mut rows);
+                    if result.len() >= row_cnt_limit {
+                        break;
+                    }
 
-                    resp.error_for_status()
-                        .and_then(|resp| self.rt.block_on(resp.text()))
-                        .map_err(reqwest_middleware::Error::from)
-                })?;
-
-                // Security: Check response size to prevent DoS
-                if body.len() > self.max_response_size {
-                    return Err(FirebaseFdwError::ResponseTooLarge(
-                        body.len(),
-                        self.max_response_size,
-                    ));
-                }
-
-                let json: JsonValue = serde_json::from_str(&body)?;
-                let mut rows = resp_to_rows(obj, &json, columns)?;
-                result.append(&mut rows);
-                if result.len() >= row_cnt_limit {
-                    break;
-                }
-
-                // get next page token, stop fetching if no more pages
-                next_page = json
-                    .get("nextPageToken")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.to_owned());
-                if next_page.is_none() {
-                    break;
+                    // get next page token, stop fetching if no more pages
+                    next_page = json
+                        .get("nextPageToken")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v.to_owned());
+                    if next_page.is_none() {
+                        break;
+                    }
                 }
             }
 
